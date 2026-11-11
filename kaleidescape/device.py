@@ -12,6 +12,7 @@ from . import message as messages
 from ._version import __version__
 from .connection import Connection
 from .dispatcher import Dispatcher
+from .error import KaleidescapeError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,15 +121,30 @@ class Device:
         """Disconnect from hardware."""
         await self._connection.disconnect()
 
+    async def async_close(self) -> None:
+        """Disconnect and release callbacks owned by this Device."""
+        await self.disconnect()
+        await self._dispatcher.async_close()
+
     async def _on_reconnect(self) -> None:
         """Refresh device state after auto-reconnect."""
         results = await asyncio.gather(
+            self._get_device_info(),
+            self._get_num_zones(),
             self._get_device_power_state(),
             self._get_system_readiness_state(),
         )
-        self._update_device_power_state(cast(messages.DevicePowerState, results[0]))
+        identity = cast(messages.DeviceInfo, results[0])
+        if (
+            self.system.serial_number
+            and identity.field_serial_number != self.system.serial_number
+        ):
+            raise KaleidescapeError("Device identity changed during reconnect")
+        self._update_device_info(identity)
+        self._update_num_zones(cast(messages.NumZones, results[1]))
+        self._update_device_power_state(cast(messages.DevicePowerState, results[2]))
         self._update_system_readiness_state(
-            cast(messages.SystemReadinessState, results[1])
+            cast(messages.SystemReadinessState, results[3])
         )
         await self.refresh()
 
@@ -140,6 +156,8 @@ class Device:
             return
 
         if self.power.state != const.DEVICE_POWER_STATE_ON:
+            return
+        if self.is_server_only:
             return
 
         results = await asyncio.gather(

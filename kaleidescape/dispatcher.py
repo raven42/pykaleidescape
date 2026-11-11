@@ -33,6 +33,7 @@ class Dispatcher:
         self._signals: list[Signal] = []
         self._loop = asyncio.get_event_loop()
         self._disconnects = []
+        self._tasks: set[asyncio.Task] = set()
 
     def connect(self, target: Callable) -> Signal:
         """Return a new signal that runs the target function."""
@@ -68,6 +69,28 @@ class Dispatcher:
         while isinstance(check_target, functools.partial):
             check_target = check_target.func
         if inspect.iscoroutinefunction(check_target):
-            return self._loop.create_task(target(*args))
+            task = self._loop.create_task(self._run_async_target(target, *args))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            return task
         target(*args)
         return None
+
+    async def _run_async_target(self, target: Callable, *args) -> None:
+        """Keep one failing listener from leaking an unhandled task error."""
+        try:
+            await target(*args)
+        except asyncio.CancelledError:  # pylint: disable=try-except-raise
+            raise
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
+            _LOGGER.warning("Signal listener failed: %s", type(error).__name__)
+
+    async def async_close(self) -> None:
+        """Explicitly cancel pending callbacks and disconnect all listeners."""
+        self.disconnect_all()
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()

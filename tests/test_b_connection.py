@@ -6,15 +6,18 @@ from unittest.mock import patch
 
 import pytest
 
+from kaleidescape import const
+from kaleidescape import message as messages
 from kaleidescape.connection import Connection
 from kaleidescape.const import STATE_CONNECTED, STATE_DISCONNECTED, STATE_RECONNECTING
 from kaleidescape.dispatcher import Dispatcher
+from kaleidescape.error import RequestNotSentError, RequestOutcomeUnknownError
 from kaleidescape.message import Response
 
 from . import create_signal
-from .emulator import Emulator
+from .emulator import Emulator, NoResponse
 
-# pylint: disable=unused-argument
+# pylint: disable=unused-argument,missing-function-docstring,protected-access
 
 # Never reached: the tests using it replace asyncio.open_connection.
 UNUSED_PORT = 10000
@@ -214,3 +217,105 @@ async def test_unhandled_exception_triggers_reconnect(emulator: Emulator):
     assert connection.state == STATE_CONNECTED
 
     await connection.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_wrong_response_name_retires_stream(emulator: Emulator):
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetAvailableDevices.name,
+        (const.SUCCESS, "WRONG_NAME", ["01"]),
+    )
+    connection = Connection(Dispatcher())
+    await connection.connect("127.0.0.1", emulator.port, 0.2)
+    with pytest.raises(RequestOutcomeUnknownError):
+        await messages.GetAvailableDevices().send(connection)
+    await asyncio.sleep(0)
+    assert connection.state == const.STATE_DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_wrong_target_cannot_acknowledge_pending_request(emulator: Emulator):
+    connection = Connection(Dispatcher())
+    await connection.connect("127.0.0.1", emulator.port, 0.2)
+    task = asyncio.create_task(NoResponse().send(connection))
+    seq = (await emulator.wait_for_request(NoResponse.name)).seq
+    await emulator.send_reply("02", seq)
+    with pytest.raises(RequestOutcomeUnknownError):
+        await task
+    await asyncio.sleep(0)
+    assert connection.state == const.STATE_DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_disconnect_wakes_pending_request(emulator: Emulator):
+    connection = Connection(Dispatcher())
+    await connection.connect("127.0.0.1", emulator.port, 1)
+    task = asyncio.create_task(NoResponse().send(connection))
+    await emulator.wait_for_request(NoResponse.name)
+    await connection.disconnect()
+    with pytest.raises(RequestOutcomeUnknownError):
+        await asyncio.wait_for(task, 0.1)
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_write_retires_stream(emulator: Emulator):
+    connection = Connection(Dispatcher())
+    await connection.connect("127.0.0.1", emulator.port, 1)
+    task = asyncio.create_task(NoResponse().send(connection))
+    await emulator.wait_for_request(NoResponse.name)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert connection.state == const.STATE_DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_disconnected_request_is_definitely_unsent(emulator: Emulator):
+    connection = Connection(Dispatcher())
+    with pytest.raises(RequestNotSentError):
+        await messages.Play().send(connection)
+    assert not emulator.requests_named(messages.Play.name)
+
+
+@pytest.mark.asyncio
+async def test_event_callback_failure_does_not_close_connection(emulator: Emulator):
+    seen = asyncio.Event()
+
+    async def failing_event(_response):
+        seen.set()
+        raise RuntimeError("fictional callback failure")
+
+    connection = Connection(Dispatcher(), on_event=failing_event)
+    await connection.connect("127.0.0.1", emulator.port, 1)
+    await emulator.wait_for_client()
+    await emulator.send_event(["01"], const.SUCCESS, messages.PlayStatus.name, ["0"])
+    await asyncio.wait_for(seen.wait(), 1)
+    assert connection.state == const.STATE_CONNECTED
+    assert (await messages.GetAvailableDevices().send(connection))[
+        0
+    ].name == messages.AvailableDevices.name
+    await connection.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_owned_event_tasks(emulator: Emulator):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def waiting_event(_response):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    connection = Connection(Dispatcher(), on_event=waiting_event)
+    await connection.connect("127.0.0.1", emulator.port, 1)
+    await emulator.wait_for_client()
+    await emulator.send_event(["01"], const.SUCCESS, messages.PlayStatus.name, ["0"])
+    await asyncio.wait_for(started.wait(), 1)
+    await connection.disconnect()
+    assert cancelled.is_set()
+    assert not connection._event_tasks

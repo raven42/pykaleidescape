@@ -10,7 +10,12 @@ from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, cast
 
 from . import const
-from .error import KaleidescapeError, MessageParseError, format_error
+from .error import (
+    MessageParseError,
+    RequestNotSentError,
+    RequestOutcomeUnknownError,
+    format_error,
+)
 from .message import Response
 
 if TYPE_CHECKING:
@@ -48,11 +53,13 @@ class Connection:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._response_handler_task: asyncio.Task | None = None
+        self._event_tasks: set[asyncio.Task] = set()
         self._reconnect_delay: float | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._reconnect_enabled: bool = False
         self._pending_requests: dict[int, Request] = {}
         self._next_seq: int = 0
+        self._retiring = False
 
     @property
     def dispatcher(self) -> Dispatcher:
@@ -122,6 +129,7 @@ class Connection:
         self._response_handler_task = asyncio.create_task(self._response_handler())
 
         self._state = const.STATE_CONNECTED
+        self._retiring = False
 
     async def _response_handler(self) -> None:
         """Main loop receiving responses and events from hardware device."""
@@ -137,8 +145,10 @@ class Connection:
                 if response.is_event:
                     # Events are unsolicited notifications about a change in state.
                     if self._on_event:
-                        asyncio.create_task(self._on_event(response))
-                elif response.device_id == const.LOCAL_CPDID:
+                        task = asyncio.create_task(self._deliver_event(response))
+                        self._event_tasks.add(task)
+                        task.add_done_callback(self._event_tasks.discard)
+                elif response.seq >= 0:
                     if response.seq not in self._pending_requests:
                         # Usually a late reply to a request that already timed out.
                         _LOGGER.warning(
@@ -146,6 +156,23 @@ class Connection:
                         )
                     else:
                         request = self._pending_requests[response.seq]
+                        if response.device_id.upper() != request.device_id.upper() or (
+                            not request._responses  # pylint: disable=protected-access
+                            and not response.is_error
+                            and request.expected_response_name is not None
+                            and response.name != request.expected_response_name
+                        ):
+                            request.fail(
+                                RequestOutcomeUnknownError("Unrelated protocol reply")
+                            )
+                            asyncio.create_task(
+                                self._handle_connection_error(
+                                    RequestOutcomeUnknownError(
+                                        "Unrelated protocol reply"
+                                    )
+                                )
+                            )
+                            return
                         request.set(response)
             except (asyncio.IncompleteReadError, OSError) as err:
                 asyncio.create_task(self._handle_connection_error(err))
@@ -157,10 +184,21 @@ class Connection:
                 asyncio.create_task(self._handle_connection_error(err))
                 return
 
+    async def _deliver_event(self, response: Response) -> None:
+        """Isolate a failed event callback from the protocol reader."""
+        assert self._on_event is not None
+        try:
+            await self._on_event(response)
+        except asyncio.CancelledError:  # pylint: disable=try-except-raise
+            raise
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
+            _LOGGER.warning("Event callback failed: %s", type(error).__name__)
+
     async def _handle_connection_error(self, err: Exception):
         """Handle connection failures and schedule reconnect."""
-        if self._reconnect_task:
+        if self._retiring or self._state != const.STATE_CONNECTED:
             return
+        self._retiring = True
 
         await self._disconnect()
 
@@ -187,14 +225,19 @@ class Connection:
                     await self._disconnect()
                     await asyncio.sleep(self._reconnect_delay)
                 else:
-                    self._reconnect_task = None
                     if self._on_reconnect:
                         try:
                             await self._on_reconnect()
-                        except Exception:  # pylint: disable=broad-except
-                            _LOGGER.exception(
-                                "Post-reconnect callback failed for %s", self._ip
+                        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
+                            _LOGGER.warning(
+                                "Post-reconnect synchronization failed: %s",
+                                type(error).__name__,
                             )
+                            await self._disconnect()
+                            self._state = const.STATE_RECONNECTING
+                            await asyncio.sleep(self._reconnect_delay)
+                            continue
+                    self._reconnect_task = None
                     self._dispatcher.send(const.STATE_CONNECTED)
                     _LOGGER.info("Reconnected to %s", self._ip)
         except Exception:  # pylint: disable=broad-except
@@ -221,6 +264,18 @@ class Connection:
 
     async def _disconnect(self):
         """Disconnect from server."""
+        for request in self._pending_requests.values():
+            request.fail(
+                RequestOutcomeUnknownError("Connection closed before acknowledgement")
+            )
+        tasks = [
+            task for task in self._event_tasks if task is not asyncio.current_task()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._event_tasks.clear()
         if self._response_handler_task:
             self._response_handler_task.cancel()
             with contextlib.suppress(BaseException):
@@ -234,16 +289,23 @@ class Connection:
         self._reader = None
         self._pending_requests.clear()
 
+    async def retire(self) -> None:
+        """Retire an ambiguous response stream without replaying a request."""
+        if self._state == const.STATE_CONNECTED:
+            await self._handle_connection_error(
+                RequestOutcomeUnknownError("Response stream retired")
+            )
+
     async def send(self, request: Request) -> Response:
-        """Send request to device"""
+        """Send one request within a single admission/write/ack deadline."""
         if self._state != const.STATE_CONNECTED:
             err = "Not connected to device"
             _LOGGER.error(err)
-            raise KaleidescapeError(err)
+            raise RequestNotSentError(err)
 
-        wait = 0.01
         assert self._timeout is not None
-        retries = self._timeout * (1 / wait)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout
 
         while request.seq < 0:
             try:
@@ -256,26 +318,45 @@ class Connection:
                     if (seq := (self._next_seq + i) % 10) not in self._pending_requests
                 )
                 self._next_seq = (request.seq + 1) % 10
-            except StopIteration as e:
-                await asyncio.sleep(wait)
-                retries = retries - 1
-                if retries <= 0:
-                    raise ConnectionError from e
-                continue
+            except StopIteration as error:
+                remaining = deadline - loop.time()
+                if remaining <= 0 or self._state != const.STATE_CONNECTED:
+                    raise RequestNotSentError("Request admission timed out") from error
+                await asyncio.sleep(min(0.01, remaining))
 
         self._pending_requests[request.seq] = request
+        request._deadline = deadline  # pylint: disable=protected-access
 
         try:
+            wire = str(request).encode("latin-1") + SEPARATOR_BYTES
             assert self._writer
             writer = self._writer
-            writer.write(str(request).encode("latin-1") + SEPARATOR_BYTES)
-            await writer.drain()
-            _LOGGER.debug("Request sent '%s'", request)
-            response = await asyncio.wait_for(request.wait(), self._timeout)
-        except (TimeoutError, OSError, ConnectionError) as err:
-            msg = f"Request '{request}' failed with '{format_error(err)}'"
-            _LOGGER.warning(msg)
-            raise KaleidescapeError(msg) from err
+            if deadline - loop.time() <= 0:
+                raise RequestNotSentError("Request deadline expired before write")
+        except (OSError, ValueError, UnicodeError, TypeError) as error:
+            raise RequestNotSentError("Request could not be encoded") from error
+        try:
+            writer.write(wire)
+            async with asyncio.timeout_at(deadline):
+                await writer.drain()
+                _LOGGER.debug("Request sent: %s", request.name)
+                response = await request.wait()
+        except (
+            TimeoutError,
+            OSError,
+            ConnectionError,
+            asyncio.CancelledError,
+        ) as error:
+            # After writer.write the device may have acted. Retire the stream so
+            # a late reply cannot acknowledge a later command on a reused slot.
+            await self._handle_connection_error(
+                RequestOutcomeUnknownError("Request outcome is unconfirmed")
+            )
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise RequestOutcomeUnknownError(
+                "Request outcome is unconfirmed"
+            ) from error
 
         return response
 

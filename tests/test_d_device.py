@@ -17,9 +17,30 @@ from kaleidescape.dispatcher import Dispatcher
 from . import create_signal
 from .emulator import Emulator
 
-# pylint: disable=unused-argument
+# pylint: disable=unused-argument,missing-function-docstring,protected-access
 
 CONTENT_HANDLE = "26-0.0-S_c446c8e2"
+
+
+@pytest.mark.asyncio
+async def test_server_only_refresh_skips_movie_queries(
+    device: Device, emulator: Emulator
+):
+    """A powered-on server has no movie zone to refresh."""
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetNumZones.name,
+        (SUCCESS, messages.NumZones.name, ["0", "0"]),
+    )
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetDevicePowerState.name,
+        (SUCCESS, messages.DevicePowerState.name, ["1", "0"]),
+    )
+    await device.connect()
+    assert device.is_server_only
+    await device.refresh()
+    assert not emulator.requests_named(messages.GetUiState.name)
 
 
 def param_id(value: object) -> str | None:
@@ -453,3 +474,36 @@ async def test_refresh_partial_failure(emulator: Emulator, device: Device):
     assert device.automation.cinemascape_mode == const.CINEMASCAPE_MODE_ANAMORPHIC
     # Fetched only after the gathered queries, so refresh carried on past the error.
     assert device.automation.cinemascape_mask == 175
+
+
+@pytest.mark.asyncio
+async def test_reconnect_rechecks_identity_before_reporting_ready(emulator: Emulator):
+    device = Device("127.0.0.1", port=emulator.port, timeout=0.2, reconnect_delay=0.01)
+    await device.connect()
+    connected = create_signal(device.dispatcher, const.STATE_CONNECTED)
+    await emulator.wait_for_client()
+    await emulator.stop()
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetDeviceInfo.name,
+        (
+            const.SUCCESS,
+            messages.DeviceInfo.name,
+            ["", "00000000DEAD", "00", "127.0.0.1"],
+        ),
+    )
+    await emulator.start()
+    await asyncio.sleep(0.05)
+    assert not connected.is_set()
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetDeviceInfo.name,
+        (
+            const.SUCCESS,
+            messages.DeviceInfo.name,
+            ["", "00000000123A", "00", "127.0.0.1"],
+        ),
+    )
+    await asyncio.wait_for(connected.wait(), 1)
+    assert device.serial_number == "00000000123A"
+    await device.disconnect()

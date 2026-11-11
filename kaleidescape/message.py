@@ -20,13 +20,47 @@ MESSAGE_TYPE_EVENT = "event"
 
 CPDID_FORMAT = re.compile(r"^\d\d$")
 DEVICEID_FORMAT = re.compile(r"^(?P<id>\d\d|#[0-9A-F]+|\?\?)(?:\.(?P<zone>\d\d))?/")
-SEQ_FORMAT = re.compile(r"^(?:\d|!)/")
+SEQ_FORMAT = re.compile(r"^(?:[0-9]|!|\?)/")
 STATUS_FORMAT = re.compile(r"^\d\d\d:")
 NAME_FORMAT = re.compile(r"^(?:([^:]+):/?|/)")
 
 registry: dict[str, type[Response]] = {}
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _encode_field(value: str) -> str:
+    """Encode a printable-protocol field without changing its boundaries."""
+    if not isinstance(value, str):
+        raise TypeError("Protocol fields must be strings")
+    escaped = {
+        "\\": r"\\",
+        "/": r"\/",
+        ":": r"\:",
+        "\n": r"\n",
+        "\r": r"\r",
+        "\t": r"\t",
+    }
+    parts: list[str] = []
+    for char in value:
+        if char in escaped:
+            parts.append(escaped[char])
+        elif 32 <= ord(char) <= 126:
+            parts.append(char)
+        elif 127 <= ord(char) <= 255:
+            parts.append(f"\\d{ord(char):03}")
+        else:
+            raise ValueError("Protocol field contains an unsupported character")
+    return "".join(parts)
+
+
+def _request_device_id(value: str) -> str:
+    """Accept a local CPDID or a complete protocol serial selector."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:\d{2}|#[0-9A-Fa-f]{1,12})", value
+    ):
+        raise ValueError("Invalid protocol device identifier")
+    return value.upper()
 
 
 def register(cls):
@@ -72,7 +106,8 @@ class MessageParser:
     def _parse_seq(self, pos: int) -> int:
         if not re.match(SEQ_FORMAT, self.message[pos:]):
             raise MessageParseError(const.ERROR_INVALID_SEQ_NUMBER, self.message)
-        self.seq = int(self.message[pos]) if self.message[pos] != "!" else -1
+        marker = self.message[pos]
+        self.seq = int(marker) if marker.isdigit() else (-1 if marker == "!" else -2)
         return pos + 2
 
     def _parse_status(self, pos: int) -> int:
@@ -96,7 +131,17 @@ class MessageParser:
             char = self.message[pos]
             if escaped:
                 if char == "d":
-                    field += chr(int(self.message[pos + 1 : pos + 4]))
+                    digits = self.message[pos + 1 : pos + 4]
+                    if (
+                        len(digits) != 3
+                        or not digits.isascii()
+                        or not digits.isdigit()
+                        or int(digits) > 255
+                    ):
+                        raise MessageParseError(
+                            const.ERROR_INVALID_PARAMETER, self.message
+                        )
+                    field += chr(int(digits))
                     pos = pos + 3
                 elif char == "r":
                     field += "\r"
@@ -116,6 +161,8 @@ class MessageParser:
                 elif char == "\r":
                     # Same bug as above
                     field += "\r"
+                else:
+                    raise MessageParseError(const.ERROR_INVALID_PARAMETER, self.message)
                 escaped = False
             elif char == "\\":
                 escaped = True
@@ -131,6 +178,9 @@ class MessageParser:
 
         if field:
             # Last field not terminated with colon
+            raise MessageParseError(const.ERROR_INVALID_PARAMETER, self.message)
+
+        if escaped:
             raise MessageParseError(const.ERROR_INVALID_PARAMETER, self.message)
 
         return pos + 1
@@ -234,15 +284,34 @@ class Request(Message):
     """Class representing a command request sent to hardware device."""
 
     log_invalid_request: bool = True
+    expected_response_name: str | None = None
 
-    def __init__(self, zone: int = 0, fields: list[str] | None = None):
+    def __init__(
+        self,
+        zone: int = 0,
+        fields: list[str] | None = None,
+        *,
+        device_id: str = LOCAL_CPDID,
+    ):
         """Initializes request."""
-        super().__init__(LOCAL_CPDID, zone, fields=fields)
+        if type(zone) is not int or not 0 <= zone <= 99:  # pylint: disable=unidiomatic-typecheck
+            raise ValueError("Protocol zone must be between 0 and 99")
+        super().__init__(_request_device_id(device_id), zone, fields=fields)
+
+        # Built-in requests have a wire contract. Leave third-party subclasses
+        # without metadata usable exactly as before.
+        if type(self).__module__ == __name__ and self.expected_response_name is None:
+            self.expected_response_name = (
+                self.name[4:] if self.name.startswith("GET_") else ""
+            )
 
         self.seq = -1
         self._type = MESSAGE_TYPE_REQUEST
         self._responses: list[Response] = []
         self._event = asyncio.Event()
+        self._failure: KaleidescapeError | None = None
+        self._in_flight = False
+        self._deadline: float | None = None
 
     @property
     def fields(self) -> list[str]:
@@ -251,8 +320,14 @@ class Request(Message):
 
     async def send(self, connection: Connection) -> list[Response]:
         """Sends request to hardware device, returning one or more responses."""
+        if self._in_flight:
+            raise KaleidescapeError("Request instance is already in flight")
+        self._in_flight = True
+        self.seq = -1
         self._event.clear()
         self._responses.clear()
+        self._failure = None
+        self._deadline = None
 
         try:
             return await self._exchange(connection)
@@ -260,6 +335,7 @@ class Request(Message):
             # Failures must release the seq too: the device allows only 10 in flight,
             # and a leaked one stays taken until the connection drops.
             connection.clear(self)
+            self._in_flight = False
 
     async def _exchange(self, connection: Connection) -> list[Response]:
         response = await connection.send(self)
@@ -274,27 +350,50 @@ class Request(Message):
             _LOGGER.log(lvl, "Request %s failed with '%s'", repr(self), response.error)
             raise MessageError(response.status, str(self))
 
+        if (
+            self.expected_response_name is not None
+            and response.name != self.expected_response_name
+        ):
+            await connection.retire()
+            raise KaleidescapeError("Unexpected response type")
+
         _LOGGER.debug("Request %s received %s", repr(self), repr(response))
 
         if response.multiline:
-            if not response.count:
-                _LOGGER.error(
-                    "Command %s response had no count '%s'", repr(self), repr(response)
-                )
-                raise KaleidescapeError("Response count expected")
+            try:
+                count = response.count
+            except (IndexError, ValueError) as error:
+                await connection.retire()
+                raise KaleidescapeError("Invalid response count") from error
+            if not 0 <= count <= 1000:
+                await connection.retire()
+                raise KaleidescapeError("Invalid response count")
 
             async def collector():
-                while (len(self._responses) - 1) < response.count:
+                while (len(self._responses) - 1) < count:
+                    if self._failure is not None:
+                        raise self._failure
                     self._event.clear()
                     await self._event.wait()
 
             try:
-                await asyncio.wait_for(collector(), connection.timeout)
+                if self._deadline is None:
+                    await asyncio.wait_for(collector(), connection.timeout)
+                else:
+                    async with asyncio.timeout_at(self._deadline):
+                        await collector()
             except TimeoutError as error:
-                err = f"Command {self!r} timed out waiting for responses"
-                _LOGGER.warning(err)
-                raise KaleidescapeError(err) from error
+                await connection.retire()
+                raise KaleidescapeError(
+                    "Timed out waiting for response rows"
+                ) from error
 
+            if isinstance(self, GetContentDetails):
+                try:
+                    _validate_content_details(self, self._responses)
+                except KaleidescapeError:
+                    await connection.retire()
+                    raise
             return self._responses
 
         return [response]
@@ -302,7 +401,14 @@ class Request(Message):
     async def wait(self) -> Response:
         """Wait until the event is set."""
         await self._event.wait()
+        if self._failure is not None:
+            raise self._failure
         return self._responses[0]
+
+    def fail(self, error: KaleidescapeError) -> None:
+        """Wake a pending request when its connection is retired."""
+        self._failure = error
+        self._event.set()
 
     def set(self, response: Response) -> None:
         """Complete request."""
@@ -310,10 +416,12 @@ class Request(Message):
         self._event.set()
 
     def __str__(self) -> str:
-        if self._message == "":
-            seq = "!" if self.seq < 0 else str(self.seq)
-            fields = ":".join(self._fields) + ":" if self._fields else ""
-            self._message = f"{self._device_id}/{seq}/{self.name}:{fields}"
+        seq = "!" if self.seq < 0 else str(self.seq)
+        fields = ":".join(_encode_field(value) for value in self._fields)
+        if fields:
+            fields += ":"
+        target = self._device_id + (f".{self._zone:02}" if self._zone else "")
+        self._message = f"{target}/{seq}/{self.name}:{fields}"
         return self._message
 
     def __repr__(self) -> str:
@@ -335,7 +443,7 @@ class Response(Message):
             parsed.device_id, parsed.zone, parsed.seq, parsed.status, parsed.fields
         )
         self._message = parsed.message
-        self._type = MESSAGE_TYPE_EVENT if parsed.seq < 0 else MESSAGE_TYPE_RESPONSE
+        self._type = MESSAGE_TYPE_EVENT if parsed.seq == -1 else MESSAGE_TYPE_RESPONSE
 
     @classmethod
     def factory(cls, message: str) -> Response:
@@ -816,6 +924,7 @@ class GetPlayingTitleName(Request):
     """Class for GET_PLAYING_TITLE_NAME messages."""
 
     name = f"GET_{const.PLAYING_TITLE_NAME}"
+    expected_response_name = const.TITLE_NAME
 
 
 @register
@@ -852,6 +961,35 @@ class GetContentDetails(Request):
     """Class for GET_CONTENT_DETAILS messages."""
 
     name = f"GET_{const.CONTENT_DETAILS}"
+    expected_response_name = const.CONTENT_DETAILS_OVERVIEW
+
+
+def _validate_content_details(request: GetContentDetails, rows: list[Response]) -> None:
+    """Reject partial, duplicate or unrelated detail rows before exposing them."""
+    overview = rows[0]
+    if not isinstance(overview, ContentDetailsOverview) or len(overview.fields) < 3:
+        raise KaleidescapeError("Invalid content overview")
+    if request.fields and overview.field_handle != request.fields[0]:
+        raise KaleidescapeError("Content handle mismatch")
+    if not overview.field_table:
+        raise KaleidescapeError("Missing content table")
+    if len(rows) != overview.count + 1:
+        raise KaleidescapeError("Incomplete content details")
+    indices: set[int] = set()
+    keys: set[str] = set()
+    for row in rows[1:]:
+        if not isinstance(row, ContentDetails) or len(row.fields) != 3:
+            raise KaleidescapeError("Invalid content detail row")
+        try:
+            index = int(row.fields[0])
+        except ValueError as error:
+            raise KaleidescapeError("Invalid content detail index") from error
+        if index < 1 or index > overview.count or index in indices:
+            raise KaleidescapeError("Invalid content detail index")
+        if not row.fields[1] or row.fields[1] in keys:
+            raise KaleidescapeError("Duplicate or empty content detail key")
+        indices.add(index)
+        keys.add(row.fields[1])
 
 
 @register

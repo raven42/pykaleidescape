@@ -1,12 +1,15 @@
 """Tests for message module."""
 
+# pylint: disable=missing-function-docstring,protected-access
+
 import pytest
 
 from kaleidescape import const
 from kaleidescape import message as messages
-from kaleidescape.error import MessageParseError
+from kaleidescape.error import KaleidescapeError, MessageParseError
 from kaleidescape.message import (
     MESSAGE_TYPE_REQUEST,
+    GetContentDetails,
     MessageParser,
     Request,
     Response,
@@ -287,3 +290,122 @@ def test_user_defined_event_parsing():
     assert isinstance(resp, UserDefinedEvent)
     assert resp.name == "USER_DEFINED_EVENT"
     assert resp.fields == ["SET_VOLUME_LEVEL", "28"]
+
+
+class ExternalRequest(Request):
+    """Represent an existing third-party Request subclass."""
+
+    name = "EXTERNAL_REQUEST"
+
+
+def test_field_encoding_and_reuse():
+    request = ExternalRequest(fields=["a:b/c\\d", "á\n\r\t"])
+    assert str(request) == r"01/!/EXTERNAL_REQUEST:a\:b\/c\\d:\d225\n\r\t:"
+    request.seq = 3
+    assert str(request).startswith("01/3/")
+    request.fields[0] = "new"
+    assert str(request).startswith("01/3/EXTERNAL_REQUEST:new:")
+
+
+def test_zone_and_serial_are_encoded_without_losing_identity():
+    request = ExternalRequest(2, ["movie"], device_id="#00000000123a")
+    request.seq = 1
+    assert str(request) == "#00000000123A.02/1/EXTERNAL_REQUEST:movie:"
+    assert MessageParser(str(request), True).device_id == "#00000000123A"
+    assert MessageParser(str(request), True).zone == 2
+
+
+@pytest.mark.parametrize("value", ["bad/name", "#123456789ABCD", "", "??"])
+def test_invalid_target_is_rejected(value):
+    with pytest.raises(ValueError, match="device identifier"):
+        ExternalRequest(device_id=value)
+
+
+@pytest.mark.parametrize("value", ["é🎬", "\x00", "\x1f"])
+def test_unsupported_field_fails_before_transmission(value):
+    with pytest.raises(ValueError, match="unsupported character"):
+        str(ExternalRequest(fields=[value]))
+
+
+def test_unknown_sequence_is_not_event():
+    response = Response.factory("01/?/000:AVAILABLE_DEVICES:01:/123")
+    assert response.seq == -2
+    assert not response.is_event
+
+
+@pytest.mark.parametrize(
+    "wire", ["01/0/000:TEST:bad\\d2:/123", "01/0/000:TEST:bad\\q:/123"]
+)
+def test_malformed_escaping_has_protocol_error(wire):
+    with pytest.raises(MessageParseError) as error:
+        MessageParser(wire)
+    assert error.value.code == const.ERROR_INVALID_PARAMETER
+
+
+def content_reply(name: str, *fields: str) -> Response:
+    """Make a response without using the production request serializer."""
+    body = ":".join(fields)
+    return Response.factory(f"01/0/000:{name}:{body + ':' if body else ''}/1")
+
+
+class ContentDetailResponses:
+    """One-response transport that also delivers a complete multipart group."""
+
+    timeout = 0.01
+
+    def __init__(self, *items: Response):
+        self.items = items
+
+    async def send(self, request):
+        for item in self.items:
+            request.set(item)
+        return self.items[0]
+
+    def clear(self, request):
+        pass
+
+    async def retire(self):
+        """Stand in for retiring the malformed reply stream."""
+
+
+@pytest.mark.asyncio
+async def test_zero_rows_are_a_valid_complete_overview():
+    request = GetContentDetails(fields=["26-0.0-S_test", ""])
+    rows = await request.send(
+        ContentDetailResponses(
+            content_reply("CONTENT_DETAILS_OVERVIEW", "0", "26-0.0-S_test", "movies")
+        )
+    )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "items",
+    [
+        (content_reply("OTHER"),),
+        (
+            content_reply("CONTENT_DETAILS_OVERVIEW", "1", "other", "movies"),
+            content_reply("CONTENT_DETAILS", "1", "Title", "A"),
+        ),
+        (
+            content_reply("CONTENT_DETAILS_OVERVIEW", "1", "26-0.0-S_test", "movies"),
+            content_reply("OTHER", "1", "Title", "A"),
+        ),
+        (
+            content_reply("CONTENT_DETAILS_OVERVIEW", "2", "26-0.0-S_test", "movies"),
+            content_reply("CONTENT_DETAILS", "1", "Title", "A"),
+            content_reply("CONTENT_DETAILS", "1", "Year", "2026"),
+        ),
+        (
+            content_reply("CONTENT_DETAILS_OVERVIEW", "2", "26-0.0-S_test", "movies"),
+            content_reply("CONTENT_DETAILS", "1", "Title", "A"),
+            content_reply("CONTENT_DETAILS", "2", "Title", "B"),
+        ),
+        (content_reply("CONTENT_DETAILS_OVERVIEW", "1001", "26-0.0-S_test", "movies"),),
+    ],
+)
+async def test_invalid_or_mismatched_group_is_rejected(items):
+    request = GetContentDetails(fields=["26-0.0-S_test", ""])
+    with pytest.raises(KaleidescapeError):
+        await request.send(ContentDetailResponses(*items))

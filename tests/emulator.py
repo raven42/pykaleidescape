@@ -156,6 +156,7 @@ class Emulator:
         self._mock_commands: dict[str, dict] = {}
         self.received_requests: list[Request] = []
         self._client_connected = asyncio.Event()
+        self._request_received = asyncio.Event()
 
         self.register_mock_command(
             ("01", "#00000000123A"),
@@ -359,6 +360,18 @@ class Emulator:
         """Returns the received requests with the given message name."""
         return [r for r in self.received_requests if r.name == name]
 
+    async def wait_for_request(self, name: str) -> Request:
+        """Wait for a named request without timing races in fault tests."""
+        while not (matches := self.requests_named(name)):
+            await self._request_received.wait()
+            self._request_received.clear()
+        return matches[-1]
+
+    async def send_reply(self, device_id: str, seq: int, name: str = "") -> None:
+        """Inject a synthetic same-sequence response for correlation tests."""
+        for client in list(self._clients):
+            await client.send(Response(device_id, seq, SUCCESS, name))
+
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Registers a new client connection synchronously, so stop() always sees it."""
         if self._server is None:
@@ -396,6 +409,7 @@ class Emulator:
 
                 request = Request(result)
                 self.received_requests.append(request)
+                self._request_received.set()
 
                 if request.device_id in self._mock_commands:
                     if request.name in self._mock_commands[request.device_id]:

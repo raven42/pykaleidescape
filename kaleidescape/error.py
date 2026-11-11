@@ -30,6 +30,14 @@ class KaleidescapeError(Exception):
     """Kaleidescape errors."""
 
 
+class RequestNotSentError(KaleidescapeError):
+    """A command was rejected before any bytes could be handed to the transport."""
+
+
+class RequestOutcomeUnknownError(KaleidescapeError):
+    """A command may have reached the device, but its outcome is unconfirmed."""
+
+
 class SystemNotFoundError(Exception):
     """Error finding system."""
 

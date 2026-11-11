@@ -12,7 +12,11 @@ from kaleidescape import message as messages
 from kaleidescape.connection import Connection
 from kaleidescape.const import LOCAL_CPDID, STATE_CONNECTED, STATE_DISCONNECTED
 from kaleidescape.dispatcher import Dispatcher
-from kaleidescape.error import KaleidescapeError, MessageError
+from kaleidescape.error import (
+    KaleidescapeError,
+    MessageError,
+    RequestOutcomeUnknownError,
+)
 
 from . import create_signal
 from .emulator import Emulator, NoResponse
@@ -55,15 +59,18 @@ async def test_command_timeout(emulator: Emulator):
 
 
 @pytest.mark.asyncio
-async def test_timeouts_release_sequence_numbers(emulator: Emulator):
-    """Test timed out requests free their seq, since only 10 can be in flight."""
+async def test_timeout_retires_stream_and_allows_fresh_connection(emulator: Emulator):
+    """A timed-out in-flight request makes the entire stream ambiguous."""
     connection = Connection(Dispatcher())
     await connection.connect("127.0.0.1", port=emulator.port, timeout=0.1)
 
     results = await asyncio.gather(
         *[NoResponse().send(connection) for _ in range(10)], return_exceptions=True
     )
-    assert all(isinstance(r, KaleidescapeError) for r in results)
+    assert all(isinstance(r, RequestOutcomeUnknownError) for r in results)
+    assert connection.state == const.STATE_DISCONNECTED
+
+    await connection.connect("127.0.0.1", port=emulator.port, timeout=0.1)
 
     res = cast(
         messages.AvailableDevices,
@@ -75,20 +82,18 @@ async def test_timeouts_release_sequence_numbers(emulator: Emulator):
 
 
 @pytest.mark.asyncio
-async def test_timed_out_sequence_number_reused_last(emulator: Emulator):
-    """Test sequence numbers rotate, so a timed out one is the last to be reused."""
+async def test_timeout_never_reuses_the_ambiguous_stream(emulator: Emulator):
+    """Recovery uses a new socket; a late ACK on the old socket cannot match."""
     connection = Connection(Dispatcher())
     await connection.connect("127.0.0.1", port=emulator.port, timeout=0.1)
 
-    with pytest.raises(KaleidescapeError):
+    with pytest.raises(RequestOutcomeUnknownError):
         await NoResponse().send(connection)
     assert emulator.requests_named(NoResponse.name)[0].seq == 0
-
-    seqs = [
-        (await messages.GetAvailableDevices().send(connection))[0].seq
-        for _ in range(10)
-    ]
-    assert seqs == [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
+    assert connection.state == const.STATE_DISCONNECTED
+    await connection.connect("127.0.0.1", port=emulator.port, timeout=0.1)
+    response = (await messages.GetAvailableDevices().send(connection))[0]
+    assert response.name == messages.AvailableDevices.name
 
     await connection.disconnect()
 
