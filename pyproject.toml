@@ -49,7 +49,7 @@ version = { attr = "kaleidescape._version.__version__" }
 [tool.pytest.ini_options]
 log_level = "DEBUG"
 testpaths = "tests"
-norecursedirs = ".git"
+norecursedirs = ".git hardware_tests"
 asyncio_default_fixture_loop_scope = "function"
 timeout = 10
 filterwarnings = [
