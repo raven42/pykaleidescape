@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
@@ -11,8 +12,9 @@ from kaleidescape import const
 from kaleidescape import message as messages
 from kaleidescape.connection import Connection
 from kaleidescape.const import ERROR_INCOMPATIBLE_VIDEO_CONFIG, LOCAL_CPDID, SUCCESS
-from kaleidescape.device import Device
+from kaleidescape.device import Device, MovieLaunchProfile
 from kaleidescape.dispatcher import Dispatcher
+from kaleidescape.error import KaleidescapeError
 
 from . import create_signal
 from .emulator import Emulator
@@ -251,6 +253,16 @@ async def test_events(emulator: Emulator, device: Device):
         (Device.enter_standby, messages.EnterStandby),
         (Device.play, messages.Play),
         (Device.pause, messages.Pause),
+        (Device.play_or_pause, messages.PlayOrPause),
+        (Device.pause_on, messages.PauseOn),
+        (Device.pause_off, messages.PauseOff),
+        (Device.page_up, messages.PageUp),
+        (Device.page_down, messages.PageDown),
+        (Device.back, messages.Back),
+        (Device.details, messages.Details),
+        (Device.go_search, messages.GoSearch),
+        (Device.menu_on, messages.MenuOn),
+        (Device.menu_off, messages.MenuOff),
         (Device.stop, messages.Stop),
         (Device.next, messages.Next),
         (Device.previous, messages.Previous),
@@ -507,3 +519,236 @@ async def test_reconnect_rechecks_identity_before_reporting_ready(emulator: Emul
     await asyncio.wait_for(connected.wait(), 1)
     assert device.serial_number == "00000000123A"
     await device.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_discovery_reads_routed_identity_without_new_connections(
+    device: Device, emulator: Emulator
+):
+    await device.connect()
+    initial_generation = device.connection.generation
+    identities = await device.discover_devices()
+    assert len(identities) == 1
+    assert identities[0].serial_number == "00000000123A"
+    assert identities[0].movie_zones == 1
+    assert identities[0].generation == initial_generation
+    assert (
+        emulator.requests_named(messages.GetDeviceInfo.name)[-1].device_id
+        == "#00000000123A"
+    )
+    assert device.connection.generation == initial_generation
+
+
+@pytest.mark.asyncio
+async def test_identity_reads_protocol_width_device_info_serial(
+    device: Device, emulator: Emulator
+):
+    # The discovery response uses 12 hex digits; DEVICE_INFO uses 16.
+    emulator.register_mock_command(
+        ("01", "#00000000123A"),
+        messages.GetDeviceInfo.name,
+        (
+            const.SUCCESS,
+            messages.DeviceInfo.name,
+            ["", "000000000000123A", "00", "127.0.0.1"],
+        ),
+    )
+    await device.connect()
+
+    direct = await device.read_identity()
+    routed = await device.read_identity("123A")
+    discovered = await device.discover_devices()
+
+    assert direct.serial_number == "00000000123A"
+    assert routed.serial_number == direct.serial_number
+    assert [identity.serial_number for identity in discovered] == [direct.serial_number]
+
+
+@pytest.mark.asyncio
+async def test_control_state_reads_actual_title_not_highlight(
+    device: Device, emulator: Emulator
+):
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetDevicePowerState.name,
+        (const.SUCCESS, messages.DevicePowerState.name, ["1", "1"]),
+    )
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetSystemReadinessState.name,
+        (const.SUCCESS, messages.SystemReadinessState.name, ["0"]),
+    )
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetPlayingTitleName.name,
+        (const.SUCCESS, messages.PlayingTitleName.name, ["Now Playing"]),
+    )
+    await device.connect()
+    state = await device.read_control_state()
+    assert state.power == const.DEVICE_POWER_STATE_ON
+    assert state.readiness == const.SYSTEM_READINESS_STATE_READY
+    assert state.playing_title == "Now Playing"
+    assert state.identity.serial_number == "00000000123A"
+
+
+@pytest.mark.asyncio
+async def test_identity_mismatch_rejected(device: Device, emulator: Emulator):
+    await device.connect()
+    emulator.register_mock_command(
+        ("#00000000123A",),
+        messages.GetDeviceInfo.name,
+        (
+            const.SUCCESS,
+            messages.DeviceInfo.name,
+            ["", "00000000DEAD", "00", "127.0.0.1"],
+        ),
+    )
+    with pytest.raises(KaleidescapeError, match="identity mismatch"):
+        await device.read_identity("00000000123A")
+
+
+@pytest.mark.asyncio
+async def test_server_only_connect_skips_movie_refresh(
+    device: Device, emulator: Emulator
+):
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetNumZones.name,
+        (const.SUCCESS, messages.NumZones.name, ["0", "0"]),
+    )
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetDevicePowerState.name,
+        (const.SUCCESS, messages.DevicePowerState.name, ["1", "0"]),
+    )
+    await device.connect()
+    assert device.is_server_only
+    assert not emulator.requests_named(messages.GetUiState.name)
+    identity = await device.read_identity()
+    assert identity.movie_zones == 0
+
+
+@pytest.mark.asyncio
+async def test_discovery_rejects_long_or_duplicate_serials(
+    device: Device, emulator: Emulator
+):
+    await device.connect()
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetAvailableDevicesBySerialNumber.name,
+        (
+            const.SUCCESS,
+            messages.AvailableDevicesBySerialNumber.name,
+            ["00000000123A", "000000000123A"],
+        ),
+    )
+    with pytest.raises(KaleidescapeError, match="Duplicate"):
+        await device.discover_devices()
+
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetAvailableDevicesBySerialNumber.name,
+        (
+            const.SUCCESS,
+            messages.AvailableDevicesBySerialNumber.name,
+            ["00000000123A", "100000000123A"],
+        ),
+    )
+    with pytest.raises(ValueError, match="serial"):
+        await device.discover_devices()
+
+
+@pytest.mark.asyncio
+async def test_unknown_readiness_is_a_typed_protocol_failure(
+    device: Device, emulator: Emulator
+):
+    await device.connect()
+    emulator.register_mock_command(
+        ("01",),
+        messages.GetSystemReadinessState.name,
+        (const.SUCCESS, messages.SystemReadinessState.name, ["99"]),
+    )
+    with pytest.raises(KaleidescapeError, match="Unknown protocol state"):
+        await device.read_control_state()
+
+
+@pytest.mark.asyncio
+async def test_explicit_pause_and_back_are_distinct(device: Device, emulator: Emulator):
+    await device.connect()
+    await device.pause_on()
+    await device.pause_on()
+    await device.pause_off()
+    await device.pause_off()
+    await device.back()
+    assert len(emulator.requests_named(messages.PauseOn.name)) == 2
+    assert len(emulator.requests_named(messages.PauseOff.name)) == 2
+    assert len(emulator.requests_named(messages.Back.name)) == 1
+    assert not emulator.requests_named(messages.Pause.name)
+    assert not emulator.requests_named(messages.Cancel.name)
+
+
+HANDLE = "26-0.0-S_c446c8e2"
+SERIAL = "00000000123A"
+
+
+@pytest.mark.asyncio
+async def test_prepare_is_read_only_and_send_once(device: Device, emulator: Emulator):
+    await device.connect()
+    prepared = await device.prepare_movie_launch(HANDLE, serial=SERIAL)
+    assert prepared.handle == HANDLE
+    assert prepared.title == "Turtle Odyssey"
+    assert prepared.bookmark_and_options == "26-0.NUL;158-0=1"
+    assert not emulator.requests_named(messages.PlayMovieExperimental.name)
+    with pytest.raises(ValueError, match="opt-in"):
+        await device.send_movie_launch(prepared)
+    assert not emulator.requests_named(messages.PlayMovieExperimental.name)
+
+    acknowledgement = await device.send_movie_launch(prepared, allow_experimental=True)
+    assert acknowledgement.status == const.SUCCESS
+    sent = emulator.requests_named(messages.PlayMovieExperimental.name)
+    assert len(sent) == 1
+    assert sent[0].device_id == "#" + SERIAL
+    assert sent[0].fields == [HANDLE, "26-0.NUL;158-0=1", ""]
+
+
+@pytest.mark.asyncio
+async def test_rejects_missing_movie_metadata(device: Device, emulator: Emulator):
+    await device.connect()
+    emulator.register_mock_command(
+        ("#" + SERIAL,),
+        messages.GetContentDetails.name,
+        [
+            (
+                const.SUCCESS,
+                messages.ContentDetailsOverview.name,
+                ["1", HANDLE, "movies"],
+            ),
+            (const.SUCCESS, messages.ContentDetails.name, ["1", "Year", "2020"]),
+        ],
+    )
+    with pytest.raises(KaleidescapeError, match="no movie title"):
+        await device.prepare_movie_launch(HANDLE, serial=SERIAL)
+    assert not emulator.requests_named(messages.PlayMovieExperimental.name)
+
+
+@pytest.mark.asyncio
+async def test_rejects_stale_preparation(device: Device, emulator: Emulator):
+    await device.connect()
+    prepared = await device.prepare_movie_launch(HANDLE, serial=SERIAL)
+    expired = replace(prepared, prepared_at=prepared.prepared_at - 11)
+    with pytest.raises(KaleidescapeError, match="expired"):
+        await device.send_movie_launch(expired, allow_experimental=True)
+    assert not emulator.requests_named(messages.PlayMovieExperimental.name)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        MovieLaunchProfile(bookmark="Other.NUL"),
+        MovieLaunchProfile(options=(("158-0", "1"), ("158-0", "2"))),
+        MovieLaunchProfile(options=(("bad:key", "1"),)),
+    ],
+)
+def test_invalid_profiles_fail_before_send(profile: MovieLaunchProfile):
+    with pytest.raises(ValueError):
+        profile.field("26-0")

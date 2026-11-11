@@ -63,6 +63,14 @@ def _request_device_id(value: str) -> str:
     return value.upper()
 
 
+def _known_state(mapping: dict[int, str], fields: list[str], index: int = 0) -> str:
+    """Translate known states without leaking a raw wire value on failure."""
+    try:
+        return mapping[int(fields[index])]
+    except (IndexError, ValueError, KeyError):
+        raise KaleidescapeError("Unknown protocol state") from None
+
+
 def register(cls):
     """Decorator registering a message response class for factory use."""
     registry[cls.name] = cls
@@ -567,6 +575,11 @@ class AvailableDevicesBySerialNumber(Response):
         """Returns list of serial numbers."""
         return [f"{i[-12:]:0>12}" for i in self._fields]
 
+    @property
+    def raw_serial_numbers(self) -> list[str]:
+        """Return complete serials for callers that must detect collisions."""
+        return list(self._fields)
+
 
 class GetSystemVersion(Request):
     """Class for GET_SYSTEM_VERSION messages."""
@@ -607,6 +620,12 @@ class DeviceInfo(Response):
     def field_serial_number(self) -> str:
         """Returns serial number."""
         return f"{self._fields[1][-12:]:0>12}"
+
+    @property
+    def field_serial_number_full(self) -> str:
+        """Canonical complete serial without truncation."""
+        value = self._fields[1].removeprefix("#").upper()
+        return value.zfill(12) if len(value) <= 12 else value
 
     @property
     def field_cpdid(self) -> str:
@@ -718,12 +737,15 @@ class DevicePowerState(Response):
     @property
     def field_power(self) -> str:
         """Returns power state."""
-        return self.index["power"][int(self._fields[0])]
+        return _known_state(self.index["power"], self._fields)
 
     @property
     def field_zone(self) -> list[str]:
         """Returns zone state."""
-        return [self.index["zone"][int(v)] for v in self._fields[1:]]
+        return [
+            _known_state(self.index["zone"], self._fields, i)
+            for i in range(1, len(self._fields))
+        ]
 
 
 class GetSystemReadinessState(Request):
@@ -746,7 +768,7 @@ class SystemReadinessState(Response):
     @property
     def field(self) -> str:
         """Returns readiness state."""
-        return self.index[int(self._fields[0])]
+        return _known_state(self.index, self._fields)
 
 
 class GetPlayStatus(Request):
@@ -771,7 +793,7 @@ class PlayStatus(Response):
     @property
     def field_play_status(self) -> str:
         """Return play status."""
-        return self.index[int(self._fields[0])]
+        return _known_state(self.index, self._fields)
 
     @property
     def field_play_speed(self) -> int:
@@ -1481,10 +1503,34 @@ class Play(Request):
     name = const.PLAY
 
 
+class PlayOrPause(Request):
+    """Class for PLAY_OR_PAUSE messages."""
+
+    name = const.PLAY_OR_PAUSE
+
+
+class PlayMovieExperimental(Request):
+    """Undocumented PLAY_MOVIE wire command; use only after explicit preparation."""
+
+    name = "PLAY_MOVIE"
+
+
 class Pause(Request):
     """Class for PAUSE messages."""
 
     name = const.PAUSE
+
+
+class PauseOn(Request):
+    """Class for explicit PAUSE_ON messages."""
+
+    name = const.PAUSE_ON
+
+
+class PauseOff(Request):
+    """Class for explicit PAUSE_OFF messages."""
+
+    name = const.PAUSE_OFF
 
 
 class Stop(Request):
@@ -1553,10 +1599,34 @@ class Right(Request):
     name = const.RIGHT
 
 
+class PageUp(Request):
+    """Class for PAGE_UP messages."""
+
+    name = const.PAGE_UP
+
+
+class PageDown(Request):
+    """Class for PAGE_DOWN messages."""
+
+    name = const.PAGE_DOWN
+
+
 class Cancel(Request):
     """Class for CANCEL messages."""
 
     name = const.CANCEL
+
+
+class Back(Request):
+    """Class for BACK messages, distinct from CANCEL."""
+
+    name = const.BACK
+
+
+class Details(Request):
+    """Class for DETAILS messages."""
+
+    name = const.DETAILS
 
 
 class StatusAndSettings(Request):
@@ -1593,6 +1663,24 @@ class GoMovieCovers(Request):
     """Class for GO_MOVIE_COVERS messages."""
 
     name = const.GO_MOVIE_COVERS
+
+
+class GoSearch(Request):
+    """Class for GO_SEARCH messages."""
+
+    name = const.GO_SEARCH
+
+
+class MenuOn(Request):
+    """Class for KALEIDESCAPE_MENU_ON messages."""
+
+    name = const.KALEIDESCAPE_MENU_ON
+
+
+class MenuOff(Request):
+    """Class for KALEIDESCAPE_MENU_OFF messages."""
+
+    name = const.KALEIDESCAPE_MENU_OFF
 
 
 class MenuToggle(Request):

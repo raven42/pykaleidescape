@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar, cast
 
@@ -17,6 +19,28 @@ from .error import KaleidescapeError
 _LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _canonical_serial(value: str) -> str:
+    """Canonicalize a routed serial without silently truncating long values."""
+    if not isinstance(value, str):
+        raise TypeError("Device serial must be a string")
+    serial = value.removeprefix("#").upper()
+    if not re.fullmatch(r"[0-9A-F]{1,16}", serial):
+        raise ValueError("Invalid device serial")
+    # Discovery and routed IDs use 12 hex digits. GET_DEVICE_INFO returns the
+    # same serial zero-padded to 16; reject any significant bits beyond 12.
+    significant = serial.lstrip("0")
+    if not significant or len(significant) > 12:
+        raise ValueError("Invalid device serial")
+    return significant.zfill(12)
+
+
+def _opaque_handle(value: str) -> str:
+    """Accept only an exact protocol-safe opaque content handle."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", value):
+        raise ValueError("Invalid movie handle")
+    return value
 
 
 def _cast(typ: type[T], result: object) -> T:  # pylint: disable=unused-argument
@@ -231,6 +255,186 @@ class Device:
         res = await self._send(messages.GetAvailableDevicesBySerialNumber)
         return (cast(messages.AvailableDevicesBySerialNumber, res)).field
 
+    async def discover_devices(self, *, max_devices: int = 64) -> list[DeviceIdentity]:
+        """Read identities through this seed connection without dialing returned IPs."""
+        if not 1 <= max_devices <= 256:
+            raise ValueError("max_devices must be between 1 and 256")
+        result = cast(
+            messages.AvailableDevicesBySerialNumber,
+            await self._send(messages.GetAvailableDevicesBySerialNumber),
+        )
+        raw = result.raw_serial_numbers
+        if len(raw) > max_devices:
+            raise KaleidescapeError("Discovery exceeds configured device limit")
+        identities: list[DeviceIdentity] = []
+        seen: set[str] = set()
+        for candidate in raw:
+            serial = _canonical_serial(candidate)
+            if serial in seen:
+                raise KaleidescapeError("Duplicate discovered device identity")
+            seen.add(serial)
+            identities.append(await self.read_identity(serial))
+        return identities
+
+    async def read_identity(self, serial: str | None = None) -> DeviceIdentity:
+        """Freshly verify the directly addressed component and movie-zone count."""
+        target = f"#{_canonical_serial(serial)}" if serial is not None else None
+        generation = self._connection.generation
+        info = cast(
+            messages.DeviceInfo,
+            await self._send(messages.GetDeviceInfo, device_id=target),
+        )
+        zones = cast(
+            messages.NumZones, await self._send(messages.GetNumZones, device_id=target)
+        )
+        kind = cast(
+            messages.DeviceTypeName,
+            await self._send(messages.GetDeviceTypeName, device_id=target),
+        )
+        if generation != self._connection.generation:
+            raise KaleidescapeError("Identity read crossed a connection change")
+        actual = _canonical_serial(info.field_serial_number_full)
+        if serial is not None and actual != _canonical_serial(serial):
+            raise KaleidescapeError("Addressed device identity mismatch")
+        try:
+            return DeviceIdentity(
+                actual,
+                kind.field,
+                zones.field_movie_zones,
+                zones.field_music_zones,
+                generation,
+                time.monotonic(),
+            )
+        except (IndexError, ValueError, KeyError) as error:
+            raise KaleidescapeError("Invalid device identity response") from error
+
+    async def read_control_state(self, serial: str | None = None) -> ControlState:
+        """Return fresh player state with identity and stream-generation evidence."""
+        identity = await self.read_identity(serial)
+        target = f"#{identity.serial_number}" if serial is not None else None
+        power = cast(
+            messages.DevicePowerState,
+            await self._send(messages.GetDevicePowerState, device_id=target),
+        )
+        readiness = cast(
+            messages.SystemReadinessState,
+            await self._send(messages.GetSystemReadinessState, device_id=target),
+        )
+        play_status: str | None = None
+        playing_title: str | None = None
+        try:
+            power_state = power.field_power
+            ready_state = readiness.field
+            if power_state == const.DEVICE_POWER_STATE_ON and identity.movie_zones:
+                play = cast(
+                    messages.PlayStatus,
+                    await self._send(messages.GetPlayStatus, device_id=target),
+                )
+                title = cast(
+                    messages.PlayingTitleName,
+                    await self._send(messages.GetPlayingTitleName, device_id=target),
+                )
+                play_status = play.field_play_status
+                playing_title = title.field
+        except (IndexError, ValueError, KeyError) as error:
+            raise KaleidescapeError("Invalid control state response") from error
+        if identity.generation != self._connection.generation:
+            raise KaleidescapeError("Control state read crossed a connection change")
+        return ControlState(
+            identity,
+            power_state,
+            ready_state,
+            play_status,
+            playing_title,
+            time.monotonic(),
+        )
+
+    async def get_highlighted_selection(self, serial: str | None = None) -> str:
+        """Read the current highlighted handle, not a cached playing title."""
+        target = f"#{_canonical_serial(serial)}" if serial is not None else None
+        response = cast(
+            messages.HighlightedSelection,
+            await self._send(messages.GetHighlightedSelection, device_id=target),
+        )
+        try:
+            return response.field
+        except IndexError as error:
+            raise KaleidescapeError("Invalid highlighted selection response") from error
+
+    async def prepare_movie_launch(
+        self,
+        handle: str,
+        *,
+        serial: str,
+        profile: MovieLaunchProfile | None = None,
+    ) -> PreparedMovieLaunch:
+        """Read-only preflight for an undocumented, serial-addressed movie launch."""
+        _opaque_handle(handle)
+        identity = await self.read_identity(serial)
+        if identity.movie_zones < 1:
+            raise KaleidescapeError("Movie launch target has no movie zone")
+        if "." not in handle:
+            highlighted = _opaque_handle(await self.get_highlighted_selection(serial))
+            if "." not in highlighted:
+                raise KaleidescapeError("A qualified movie handle is required")
+            handle = highlighted.split(".", 1)[0] + "." + handle
+        namespace, _, suffix = handle.partition(".")
+        if not namespace or not suffix:
+            raise ValueError("Movie handle has no namespace")
+        details = await self.get_content_details(handle, serial=serial)
+        if details.field_handle != handle or details.field_table != "movies":
+            raise KaleidescapeError("Content details do not identify this movie")
+        if not details.field_title:
+            raise KaleidescapeError("Content details have no movie title")
+        if identity.generation != self._connection.generation:
+            raise KaleidescapeError("Movie preparation crossed a connection change")
+        selected_profile = profile if profile is not None else MovieLaunchProfile()
+        return PreparedMovieLaunch(
+            identity,
+            handle,
+            selected_profile.field(namespace),
+            details.field_title,
+            time.monotonic(),
+        )
+
+    async def send_movie_launch(
+        self, prepared: PreparedMovieLaunch, *, allow_experimental: bool = False
+    ) -> Response:
+        """Send one experimental PLAY_MOVIE command; ACK is not playback proof."""
+        if not allow_experimental:
+            raise ValueError("Experimental movie launch requires opt-in")
+        if not isinstance(prepared, PreparedMovieLaunch):
+            raise TypeError("Expected prepared movie launch")
+        if prepared.identity.generation != self._connection.generation:
+            raise KaleidescapeError("Movie preparation is stale after reconnect")
+        if time.monotonic() - prepared.prepared_at > 10:
+            raise KaleidescapeError("Movie preparation has expired")
+        _opaque_handle(prepared.handle)
+        _opaque_handle(prepared.bookmark_and_options.split(";", 1)[0])
+        if prepared.identity.movie_zones < 1 or not prepared.title:
+            raise KaleidescapeError("Invalid prepared movie launch")
+        return await self._send(
+            messages.PlayMovieExperimental,
+            fields=[prepared.handle, prepared.bookmark_and_options, ""],
+            device_id=f"#{prepared.identity.serial_number}",
+        )
+
+    async def play_movie_experimental(
+        self,
+        handle: str,
+        *,
+        serial: str,
+        profile: MovieLaunchProfile | None = None,
+        allow_experimental: bool = False,
+    ) -> Response:
+        """Prepare and send one opt-in launch without automatic retry or fallback."""
+        if not allow_experimental:
+            raise ValueError("Experimental movie launch requires opt-in")
+        prepared = await self.prepare_movie_launch(
+            handle, serial=serial, profile=profile
+        )
+        return await self.send_movie_launch(prepared, allow_experimental=True)
+
     async def get_available_devices(self) -> list[str]:
         """Return a list of cpdid's in the system that have cpdid's assigned."""
         res = await self._send(messages.GetAvailableDevices)
@@ -248,9 +452,21 @@ class Device:
         """Send play command."""
         await self._send(messages.Play)
 
+    async def play_or_pause(self) -> None:
+        """Toggle playback on a movie player."""
+        await self._send(messages.PlayOrPause)
+
     async def pause(self) -> None:
         """Send pause command."""
         await self._send(messages.Pause)
+
+    async def pause_on(self) -> None:
+        """Explicitly pause playback, without toggling an already paused player."""
+        await self._send(messages.PauseOn)
+
+    async def pause_off(self) -> None:
+        """Explicitly resume playback, without toggling an already playing player."""
+        await self._send(messages.PauseOff)
 
     async def stop(self) -> None:
         """Send stop command."""
@@ -296,9 +512,25 @@ class Device:
         """Send right command."""
         await self._send(messages.Right)
 
+    async def page_up(self) -> None:
+        """Scroll the current on-screen list up one page."""
+        await self._send(messages.PageUp)
+
+    async def page_down(self) -> None:
+        """Scroll the current on-screen list down one page."""
+        await self._send(messages.PageDown)
+
     async def cancel(self) -> None:
         """Send cancel command."""
         await self._send(messages.Cancel)
+
+    async def back(self) -> None:
+        """Send the BACK navigation command, distinct from CANCEL."""
+        await self._send(messages.Back)
+
+    async def details(self) -> None:
+        """Toggle on-screen details for the selected movie."""
+        await self._send(messages.Details)
 
     async def status_and_settings(self) -> None:
         """Send status_and_settings command."""
@@ -323,6 +555,18 @@ class Device:
     async def go_movie_covers(self) -> None:
         """Send go_movie_covers command."""
         await self._send(messages.GoMovieCovers)
+
+    async def go_search(self) -> None:
+        """Open the movie-player on-screen search interface."""
+        await self._send(messages.GoSearch)
+
+    async def menu_on(self) -> None:
+        """Show the Kaleidescape menu."""
+        await self._send(messages.MenuOn)
+
+    async def menu_off(self) -> None:
+        """Hide the Kaleidescape menu."""
+        await self._send(messages.MenuOff)
 
     async def menu_toggle(self) -> None:
         """Send menu toggle command."""
@@ -466,11 +710,18 @@ class Device:
         self.movie.chapter_location = res.field_chapter_location
 
     async def get_content_details(
-        self, handle: str, passcode: str | None = None
+        self,
+        handle: str,
+        passcode: str | None = None,
+        *,
+        serial: str | None = None,
     ) -> messages.ContentDetailsOverview:
         """Return content details for the currently selected title."""
         responses: list[Response] = await self._send_multi(
-            messages.GetContentDetails, 0, [handle, passcode if passcode else ""]
+            messages.GetContentDetails,
+            0,
+            [handle, passcode if passcode else ""],
+            device_id=f"#{_canonical_serial(serial)}" if serial is not None else None,
         )
         overview = cast(messages.ContentDetailsOverview, responses[0])
         for response in responses[1:]:
@@ -574,18 +825,32 @@ class Device:
         self.automation.cinemascape_mask = res.field
 
     async def _send(
-        self, request: type[RequestT], zone: int = 0, fields: list[str] | None = None
+        self,
+        request: type[RequestT],
+        zone: int = 0,
+        fields: list[str] | None = None,
+        *,
+        device_id: str | None = None,
     ) -> Response:
         """Send request to hardware, returning a single response."""
-        res = await self._send_multi(request, zone, fields)
+        res = await self._send_multi(request, zone, fields, device_id=device_id)
         assert len(res) == 1
         return res[0]
 
     async def _send_multi(
-        self, request: type[RequestT], zone: int = 0, fields: list[str] | None = None
+        self,
+        request: type[RequestT],
+        zone: int = 0,
+        fields: list[str] | None = None,
+        *,
+        device_id: str | None = None,
     ) -> list[Response]:
         """Send request to hardware, returning one or more responses."""
-        req = request(zone, fields)
+        req = (
+            request(zone, fields)
+            if device_id is None
+            else request(zone, fields, device_id=device_id)
+        )
         return await req.send(self._connection)
 
     async def _handle_event(self, response: Response) -> None:
@@ -690,6 +955,79 @@ class Device:
     def is_music_player(self) -> bool:
         """Return if device has a music zone."""
         return self.system.music_zones - self.system.movie_zones > 0
+
+
+@dataclass(frozen=True)
+class DeviceIdentity:
+    """Freshly read identity for one component on a specific connection."""
+
+    serial_number: str
+    model: str
+    movie_zones: int
+    music_zones: int
+    generation: int
+    observed_at: float
+
+
+@dataclass(frozen=True)
+class ControlState:
+    """Fresh status and actual playing title, separate from highlighted content."""
+
+    identity: DeviceIdentity
+    power: str
+    readiness: str
+    play_status: str | None
+    playing_title: str | None
+    observed_at: float
+
+
+@dataclass(frozen=True)
+class MovieLaunchProfile:
+    """Replaceable, unverified settings for the undocumented PLAY_MOVIE command."""
+
+    bookmark: str = "NUL"
+    options: tuple[tuple[str, str], ...] = (("158-0", "1"),)
+
+    def field(self, namespace: str) -> str:
+        """Validate and encode a bookmark/options field without protocol delimiters."""
+        _opaque_handle(namespace)
+        bookmark = _opaque_handle(self.bookmark)
+        if "." in namespace:
+            raise ValueError("Namespace must be one token")
+        if "." in bookmark and not bookmark.startswith(namespace + "."):
+            raise ValueError("Bookmark belongs to another namespace")
+        if not isinstance(self.options, tuple) or len(self.options) > 16:
+            raise ValueError("Invalid experimental option count")
+        seen: set[str] = set()
+        suffixes: list[str] = []
+        for option in self.options:
+            if not isinstance(option, tuple) or len(option) != 2:
+                raise ValueError("Invalid experimental option")
+            key, value = option
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", key)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value)
+                or key in seen
+            ):
+                raise ValueError("Invalid experimental option")
+            seen.add(key)
+            suffixes.append(f";{key}={value}")
+        return (bookmark if "." in bookmark else namespace + "." + bookmark) + "".join(
+            suffixes
+        )
+
+
+@dataclass(frozen=True)
+class PreparedMovieLaunch:
+    """Read-only, short-lived preflight evidence for one movie launch."""
+
+    identity: DeviceIdentity
+    handle: str
+    bookmark_and_options: str
+    title: str
+    prepared_at: float
 
 
 @dataclass

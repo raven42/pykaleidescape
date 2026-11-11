@@ -60,6 +60,7 @@ class Connection:
         self._pending_requests: dict[int, Request] = {}
         self._next_seq: int = 0
         self._retiring = False
+        self._generation = 0
 
     @property
     def dispatcher(self) -> Dispatcher:
@@ -85,6 +86,11 @@ class Connection:
     def state(self) -> str:
         """Return state of the connection to the hardware device."""
         return self._state
+
+    @property
+    def generation(self) -> int:
+        """Incremented for each successfully opened TCP stream."""
+        return self._generation
 
     async def connect(
         self,
@@ -130,6 +136,7 @@ class Connection:
 
         self._state = const.STATE_CONNECTED
         self._retiring = False
+        self._generation += 1
 
     async def _response_handler(self) -> None:
         """Main loop receiving responses and events from hardware device."""

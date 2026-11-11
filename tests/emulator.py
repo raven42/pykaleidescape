@@ -22,7 +22,10 @@ SIMPLE_COMMANDS: tuple[type[messages.Request], ...] = (
     messages.LeaveStandby,
     messages.EnterStandby,
     messages.Play,
+    messages.PlayOrPause,
     messages.Pause,
+    messages.PauseOn,
+    messages.PauseOff,
     messages.Stop,
     messages.Next,
     messages.Previous,
@@ -34,13 +37,20 @@ SIMPLE_COMMANDS: tuple[type[messages.Request], ...] = (
     messages.Down,
     messages.Left,
     messages.Right,
+    messages.PageUp,
+    messages.PageDown,
     messages.Cancel,
+    messages.Back,
+    messages.Details,
     messages.StatusAndSettings,
     messages.IntermissionToggle,
     messages.GoMovieList,
     messages.GoMovieCollections,
     messages.GoMovies,
     messages.GoMovieCovers,
+    messages.GoSearch,
+    messages.MenuOn,
+    messages.MenuOff,
     messages.MenuToggle,
 )
 
@@ -235,6 +245,11 @@ class Emulator:
         )
         self.register_mock_command(
             ("01", "#00000000123A"),
+            messages.GetPlayingTitleName.name,
+            (SUCCESS, messages.PlayingTitleName.name, [""]),
+        )
+        self.register_mock_command(
+            ("01", "#00000000123A"),
             messages.GetPlayStatus.name,
             (SUCCESS, messages.PlayStatus.name, ["0", "1", "00", "00000", "00000", "000", "00000", "00000"]),
         )
@@ -285,6 +300,9 @@ class Emulator:
                 command.name,
                 (SUCCESS,),
             )
+        self.register_mock_command(
+            ("#00000000123A",), messages.PlayMovieExperimental.name, (SUCCESS,)
+        )
         self.register_mock_command(
             ("01",),
             messages.SendEvent.name,
