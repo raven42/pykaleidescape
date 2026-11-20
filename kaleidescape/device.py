@@ -258,6 +258,40 @@ class Device:
         """Send scan_reverse command."""
         await self._send(messages.ScanReverse)
 
+    async def get_user_input(self) -> messages.UserInput:
+        """Read the current user input prompt and entry."""
+        return cast(messages.UserInput, await self._send(messages.GetUserInput))
+
+    async def keyboard_literal(self, character: str) -> None:
+        """Send one printable ASCII character to the onscreen keyboard."""
+        if len(character) != 1 or not 32 <= ord(character) <= 126:
+            raise ValueError("Character must be one printable ASCII character")
+        await self._send(messages.KeyboardLiteral, 0, [character])
+
+    async def set_user_input_entry(self, entry: str) -> None:
+        """Set the complete input entry on a Strato or Alto player."""
+        await self._send(messages.SetUserInputEntry, 0, [entry])
+
+    async def go_movie_collection(self, name: str) -> None:
+        """Display the movie collection with the exact given name."""
+        await self._send(messages.GoMovieCollection, 0, [name])
+
+    async def go_movie_store(self) -> None:
+        """Display the movie store."""
+        await self._send(messages.GoMovieStore)
+
+    async def go_screen_saver(self) -> None:
+        """Display the screen saver without interrupting playback."""
+        await self._send(messages.GoScreenSaver)
+
+    async def stop_screen_saver(self) -> None:
+        """Dismiss the screen saver."""
+        await self._send(messages.StopScreenSaver)
+
+    async def backspace(self) -> None:
+        """Delete the last character from the current user input."""
+        await self._send(messages.Backspace)
+
     async def select(self) -> None:
         """Send select command."""
         await self._send(messages.Select)
