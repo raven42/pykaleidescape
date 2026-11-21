@@ -766,6 +766,76 @@ class FriendlyName(Response):
         return self._fields[0]
 
 
+class GetUserInput(Request):
+    """Request the current user input prompt and entry."""
+
+    name = "GET_USER_INPUT"
+
+
+@register
+class UserInput(Response):
+    """User input state returned by GET_USER_INPUT or sent as an event."""
+
+    name = "USER_INPUT"
+
+    @property
+    def field_type(self) -> int:
+        """Return 0 for no prompt, 1 for alphanumeric, or 2 for numeric."""
+        return int(self._fields[0])
+
+    @property
+    def field_prompt(self) -> str:
+        """Return the prompt text."""
+        return self._fields[1]
+
+    @property
+    def field_entry(self) -> str:
+        """Return the current entry."""
+        return self._fields[2]
+
+
+class KeyboardLiteral(Request):
+    """Send a literal character to the onscreen keyboard."""
+
+    name = "KEYBOARD_LITERAL"
+
+
+class SetUserInputEntry(Request):
+    """Set the current user input entry on Strato or Alto."""
+
+    name = "SET_USER_INPUT_ENTRY"
+
+
+class GoMovieCollection(Request):
+    """Display a named movie collection."""
+
+    name = "GO_MOVIE_COLLECTION"
+
+
+class GoMovieStore(Request):
+    """Display the movie store."""
+
+    name = "GO_MOVIE_STORE"
+
+
+class GoScreenSaver(Request):
+    """Display the screen saver without interrupting playback."""
+
+    name = "GO_SCREEN_SAVER"
+
+
+class StopScreenSaver(Request):
+    """Dismiss the screen saver."""
+
+    name = "STOP_SCREEN_SAVER"
+
+
+class Backspace(Request):
+    """Delete the last character from the current input."""
+
+    name = "BACKSPACE"
+
+
 class GetUiState(Request):
     """Class for GET_UI_STATE messages."""
 
